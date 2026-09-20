@@ -1,0 +1,20 @@
+services:
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: vaultwarden
+    restart: unless-stopped
+    environment:
+      # Адреса, за якою відкривається сховище (Tailscale, HTTPS)
+      DOMAIN: ${DOMAIN}
+      # Реєстрація вимкнена. Для створення першого акаунта запускати так:
+      #   SIGNUPS_ALLOWED=true docker compose up -d
+      SIGNUPS_ALLOWED: ${SIGNUPS_ALLOWED:-false}
+      INVITATIONS_ALLOWED: "false"
+      # Панель адміністратора; токен — argon2-хеш, див. README
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+    volumes:
+      # База, вкладення і ключі. Саме цю папку бекапить backup.sh
+      - ./data:/data
+    ports:
+      # Тільки локально. Назовні віддає Tailscale, тому в мережу порт не публікується.
+      - "127.0.0.1:8080:80"

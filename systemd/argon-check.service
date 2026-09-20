@@ -1,0 +1,11 @@
+[Unit]
+Description=Make sure Argon ONE fan is controlled
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/argon-check
+
+[Install]
+WantedBy=multi-user.target
+CHKSVC

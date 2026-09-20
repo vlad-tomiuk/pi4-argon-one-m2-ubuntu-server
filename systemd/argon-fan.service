@@ -1,0 +1,12 @@
+[Unit]
+Description=Argon ONE fan control (fallback)
+After=multi-user.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/argon-fan
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+FANSVC

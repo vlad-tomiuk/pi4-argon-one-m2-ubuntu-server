@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+sleep 60
+if systemctl is-active --quiet argononed 2>/dev/null; then
+  systemctl disable --now argon-fan 2>/dev/null || true
+  echo "argon-check: офіційний драйвер працює"
+else
+  systemctl disable --now argononed 2>/dev/null || true
+  systemctl enable --now argon-fan
+  echo "argon-check: офіційний драйвер не працює, увімкнено запасний argon-fan"
+fi
+CHK

@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
 # =====================================================================
-#  pi4-argon-one-m2-ubuntu-server / install.sh
+#  pi-server / install.sh
 #  Raspberry Pi 4 + Argon ONE M.2  →  Ubuntu Server 24.04 LTS на SSD
 #
-#  Що робить:
-#   1. Знаходить SSD, повністю стирає і записує Ubuntu Server
-#   2. Створює твого користувача, hostname, часовий пояс
-#   3. Wi-Fi: сканує мережі, даєш вибрати зі списку і ввести пароль
-#   4. Безпека: UFW, fail2ban, жорсткий SSH, автооновлення безпеки
-#   5. Автовідновлення: watchdog, reboot при kernel panic, fsck, журнал
-#   6. Docker + Docker Compose
-#   7. Вентилятор Argon ONE: офіційний драйвер + запасний, якщо офіційний не працює
+#  Запускається з Raspberry Pi OS на microSD і робить три речі:
+#    1. стирає SSD і записує на нього Ubuntu Server;
+#    2. пише cloud-init: користувач, hostname, Wi-Fi, SSH-ключі;
+#    3. ставить pi-setup.service, який при першому старті Ubuntu
+#       клонує цей репозиторій і виконує scripts/firstboot.sh.
 #
-#  Репозиторій: https://github.com/vlad-tomiuk/pi4-argon-one-m2-ubuntu-server
+#  Усе інше — захист, Docker, команди сервера, вентилятор — живе
+#  в репозиторії, а не в цьому файлі. Оновити потім: server-update --self
 #
-#  Запуск (з Raspberry Pi OS на microSD):
+#  Запуск:
 #     curl -fsSL https://raw.githubusercontent.com/vlad-tomiuk/pi4-argon-one-m2-ubuntu-server/main/install.sh -o install.sh
-#     sudo bash install.sh                  # усе спитає сам
-#     sudo bash install.sh --help           # параметри
+#     sudo bash install.sh              # усе спитає сам
+#     sudo bash install.sh --help       # параметри
 # =====================================================================
 set -euo pipefail
 
@@ -25,6 +23,7 @@ UBUNTU_VER=24.04
 BASE_URL="https://cdimage.ubuntu.com/releases/${UBUNTU_VER}/release"
 WORKDIR=/root/ubuntu-img
 MIN_SIZE_GB=8
+REPO_URL_DEFAULT="https://github.com/vlad-tomiuk/pi4-argon-one-m2-ubuntu-server.git"
 
 G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; B='\033[1m'; NC='\033[0m'
 log(){  echo -e "${G}[+] $1${NC}"; }
@@ -42,6 +41,7 @@ usage(){ cat << 'HELP'
   -c, --country CODE      Країна для Wi-Fi (за замовчуванням UA)
   -t, --timezone TZ       Часовий пояс (за замовчуванням Europe/Kyiv)
       --lan CIDR          Мережа, з якої дозволено SSH (визначається сама)
+      --repo URL          Репозиторій з налаштуваннями (свій форк)
       --no-docker         Не ставити Docker
       --no-argon          Не ставити драйвер вентилятора Argon
   -h, --help              Ця довідка
@@ -59,7 +59,7 @@ HELP
 # Параметри
 # ---------------------------------------------------------------------
 HOST=""; NEW_USER=""; WIFI_SSID=""; NO_WIFI=no; COUNTRY="UA"; TZONE="Europe/Kyiv"
-LAN_CIDR=""; INSTALL_DOCKER=yes; INSTALL_ARGON=yes
+LAN_CIDR=""; INSTALL_DOCKER=yes; INSTALL_ARGON=yes; REPO_URL="$REPO_URL_DEFAULT"
 while [ $# -gt 0 ]; do
   case "$1" in
     -n|--hostname) HOST="${2:?}"; shift 2 ;;
@@ -69,6 +69,7 @@ while [ $# -gt 0 ]; do
     -c|--country)  COUNTRY="${2:?}"; shift 2 ;;
     -t|--timezone) TZONE="${2:?}"; shift 2 ;;
     --lan)         LAN_CIDR="${2:?}"; shift 2 ;;
+    --repo)        REPO_URL="${2:?}"; shift 2 ;;
     --no-docker)   INSTALL_DOCKER=no; shift ;;
     --no-argon)    INSTALL_ARGON=no; shift ;;
     -h|--help)     usage; exit 0 ;;
@@ -234,6 +235,7 @@ echo "SSH дозволено з:    $LAN_CIDR"
 echo "Wi-Fi:              $([ -n "$WIFI_SSID" ] && echo "$WIFI_SSID ($COUNTRY)" || echo "ні, кабель")"
 echo "Docker:             $INSTALL_DOCKER"
 echo "Вентилятор Argon:   $INSTALL_ARGON"
+echo "Репозиторій:        $REPO_URL"
 echo "SSH-ключі:          $([ -n "$SSH_BLOCK" ] && echo "будуть перенесені" || echo "не знайдено")"
 echo -e "${B}==========================================${NC}"
 read -rp "Все правильно? УСІ дані на $DISK буде знищено. Введи YES: " ok
@@ -329,9 +331,6 @@ users:
 ${SSH_BLOCK}
 
 ssh_pwauth: true
-
-runcmd:
-  - [bash, /opt/pi-setup/bootstrap.sh]
 UD
 
 if [ -n "$WIFI_SSID" ]; then
@@ -360,310 +359,73 @@ fi
 unset WIFI_PASS AP_BODY
 
 # ---------------------------------------------------------------------
-# 9. Скрипт першого запуску + команди
+# 9. Перший запуск: сервіс, який тягне репозиторій і виконує firstboot.sh
 # ---------------------------------------------------------------------
-log "Пишу скрипт першого запуску..."
-mkdir -p "$MR/opt/pi-setup" "$MR/usr/local/bin" "$MR/etc/systemd/system"
+log "Готую перший запуск..."
+mkdir -p "$MR/opt/pi-setup" "$MR/etc/systemd/system"
 
 cat > "$MR/opt/pi-setup/setup.conf" << CONF
 SERVER_USER=${NEW_USER}
 LAN_CIDR=${LAN_CIDR}
 INSTALL_DOCKER=${INSTALL_DOCKER}
 INSTALL_ARGON=${INSTALL_ARGON}
+REPO_URL=${REPO_URL}
+REPO_DIR=/opt/pi-server
 CONF
 
-# ---- запасний контролер вентилятора Argon (працює без офіційного драйвера) ----
-cat > "$MR/usr/local/bin/argon-fan" << 'FAN'
-#!/usr/bin/env python3
-# Запасний контролер вентилятора Argon ONE (I2C 0x1a на шині 1).
-# Крива: (температура °C, швидкість %). Змінюй тут, потім: sudo systemctl restart argon-fan
-CURVE = [(65, 100), (60, 55), (55, 30)]
-HYSTERESIS = 3     # °C: знижувати оберти тільки коли стало на 3° холодніше
-INTERVAL = 10      # секунд між перевірками
-
-import sys, time, signal
-try:
-    import smbus
-except ImportError:
-    sys.exit("Немає python3-smbus: sudo apt install python3-smbus")
-
-ADDR = 0x1a
-bus = smbus.SMBus(1)
-current = -1
-
-def temp():
-    with open("/sys/class/thermal/thermal_zone0/temp") as f:
-        return int(f.read()) / 1000
-
-def speed_for(t):
-    for threshold, speed in CURVE:
-        if t >= threshold:
-            return speed
-    return 0
-
-def set_speed(s):
-    global current
-    if s == current:
-        return
-    try:
-        bus.write_byte(ADDR, s)
-        current = s
-        print(f"fan {s}%", flush=True)
-    except OSError as e:
-        print(f"I2C error: {e}", flush=True)
-
-signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
-
-while True:
-    t = temp()
-    up, down = speed_for(t), speed_for(t + HYSTERESIS)
-    if up > current:
-        set_speed(up)
-    elif down < current:
-        set_speed(down)
-    time.sleep(INTERVAL)
-FAN
-
-cat > "$MR/etc/systemd/system/argon-fan.service" << 'FANSVC'
-[Unit]
-Description=Argon ONE fan control (fallback)
-After=multi-user.target
-
-[Service]
-ExecStart=/usr/bin/python3 /usr/local/bin/argon-fan
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-FANSVC
-
-# Перевірка при кожному старті: якщо офіційний драйвер не працює → вмикаємо запасний
-cat > "$MR/usr/local/bin/argon-check" << 'CHK'
-#!/usr/bin/env bash
-sleep 60
-if systemctl is-active --quiet argononed 2>/dev/null; then
-  systemctl disable --now argon-fan 2>/dev/null || true
-  echo "argon-check: офіційний драйвер працює"
-else
-  systemctl disable --now argononed 2>/dev/null || true
-  systemctl enable --now argon-fan
-  echo "argon-check: офіційний драйвер не працює, увімкнено запасний argon-fan"
-fi
-CHK
-
-cat > "$MR/etc/systemd/system/argon-check.service" << 'CHKSVC'
-[Unit]
-Description=Make sure Argon ONE fan is controlled
-After=multi-user.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/argon-check
-
-[Install]
-WantedBy=multi-user.target
-CHKSVC
-
-cat > "$MR/usr/local/bin/argon-fan-test" << 'TEST'
-#!/usr/bin/env bash
-# Перевірка вентилятора: 100% на 5 секунд, потім повертаємо керування драйверу
-[ "$EUID" -eq 0 ] || exec sudo "$0" "$@"
-echo "I2C пристрої на шині 1 (має бути 1a):"
-i2cdetect -y 1 | grep -E "^10:|1a" || true
-systemctl stop argononed argon-fan 2>/dev/null
-echo "Вентилятор 100% на 5 секунд..."
-python3 -c "import smbus; smbus.SMBus(1).write_byte(0x1a, 100)" && sleep 5
-python3 -c "import smbus; smbus.SMBus(1).write_byte(0x1a, 0)"
-systemctl start argon-check >/dev/null 2>&1 &
-echo "Якщо вентилятор загудів, усе працює. Керування повернеться драйверу за хвилину."
-TEST
-
-# ---- bootstrap: виконується ОДИН раз при першому старті Ubuntu ----
+# Завантажувач: єдине, що лишається вбудованим у install.sh. Решта — у репозиторії,
+# тому налаштування можна правити і оновлювати без переустановлення системи.
 cat > "$MR/opt/pi-setup/bootstrap.sh" << 'BOOT'
 #!/usr/bin/env bash
+# Тягне репозиторій і передає керування scripts/firstboot.sh.
 set -uo pipefail
 exec > >(tee -a /var/log/pi-setup.log) 2>&1
-MARK=/opt/pi-setup/.done
-[ -f "$MARK" ] && { echo "Налаштування вже виконано"; exit 0; }
+
+[ -f /opt/pi-setup/.done ] && { echo "Налаштування вже виконано"; exit 0; }
 # shellcheck disable=SC1091
 source /opt/pi-setup/setup.conf
+
+echo "=== $(date '+%F %T')  Завантаження налаштувань ==="
 export DEBIAN_FRONTEND=noninteractive
-APT="apt-get -y -o DPkg::Lock::Timeout=900"
-step(){ echo; echo "=== $(date '+%F %T')  $1 ==="; }
+command -v git >/dev/null || apt-get -y -o DPkg::Lock::Timeout=900 install git
 
-step "Оновлення системи"
-$APT update
-$APT full-upgrade
-$APT install ufw fail2ban python3-systemd unattended-upgrades htop git curl i2c-tools python3-smbus avahi-daemon
+# Мережа при першому старті буває ще не готова — пробуємо кілька разів.
+for i in 1 2 3 4 5; do
+    [ -d "$REPO_DIR/.git" ] && break
+    git clone --depth 1 "$REPO_URL" "$REPO_DIR" && break
+    echo "Спроба $i не вдалася, чекаю 30 с..."
+    sleep 30
+done
 
-if [ "$INSTALL_DOCKER" = "yes" ]; then
-  step "Docker"
-  $APT install docker.io docker-compose-v2
-  mkdir -p /etc/docker
-  cat > /etc/docker/daemon.json << 'J'
-{ "log-driver": "json-file", "log-opts": { "max-size": "10m", "max-file": "3" } }
-J
-  systemctl enable docker
-  systemctl restart docker
-  usermod -aG docker "$SERVER_USER"
+if [ ! -d "$REPO_DIR/.git" ]; then
+    echo "!!! Не вдалося отримати $REPO_URL. Сервіс спробує знову при наступному старті."
+    exit 1
 fi
 
-step "Файрвол UFW"
-ufw default deny incoming
-ufw default allow outgoing
-ufw allow from "$LAN_CIDR" to any port 22 proto tcp comment 'SSH only from LAN'
-ufw allow from "$LAN_CIDR" to any port 5353 proto udp comment 'mDNS: hostname.local in LAN'
-ufw --force enable
-
-step "SSH"
-cat > /etc/ssh/sshd_config.d/10-hardening.conf << EOF2
-PermitRootLogin no
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-PubkeyAuthentication yes
-MaxAuthTries 3
-MaxSessions 5
-LoginGraceTime 30
-X11Forwarding no
-AllowUsers ${SERVER_USER}
-ClientAliveInterval 300
-ClientAliveCountMax 2
-EOF2
-if ! grep -q '^# pi-setup: password only from LAN' /etc/ssh/sshd_config; then
-  printf '\n# pi-setup: password only from LAN\nMatch Address %s\n    PasswordAuthentication yes\n' "$LAN_CIDR" >> /etc/ssh/sshd_config
-fi
-mkdir -p /run/sshd
-if sshd -t; then
-  systemctl restart ssh
-else
-  echo "!!! Помилка конфігу SSH, відкочую"
-  rm -f /etc/ssh/sshd_config.d/10-hardening.conf
-  sed -i '/^# pi-setup: password only from LAN/,$d' /etc/ssh/sshd_config
-fi
-
-step "fail2ban"
-cat > /etc/fail2ban/jail.local << 'F2B'
-[DEFAULT]
-bantime  = 1h
-bantime.increment = true
-bantime.maxtime = 1w
-findtime = 10m
-maxretry = 5
-ignoreip = 127.0.0.1/8 ::1
-backend  = systemd
-
-[sshd]
-enabled = true
-F2B
-systemctl enable fail2ban
-systemctl restart fail2ban
-
-step "Автооновлення безпеки"
-cat > /etc/apt/apt.conf.d/20auto-upgrades << 'AU'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::AutocleanInterval "7";
-AU
-
-step "Захист мережі на рівні ядра"
-cat > /etc/sysctl.d/99-hardening.conf << 'SC'
-net.ipv4.tcp_syncookies = 1
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv6.conf.all.accept_redirects = 0
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.all.accept_source_route = 0
-net.ipv4.icmp_echo_ignore_broadcasts = 1
-net.ipv4.conf.all.log_martians = 1
-kernel.kptr_restrict = 2
-kernel.dmesg_restrict = 1
-SC
-
-step "Автовідновлення після збоїв"
-mkdir -p /etc/systemd/system.conf.d
-cat > /etc/systemd/system.conf.d/watchdog.conf << 'WD'
-[Manager]
-RuntimeWatchdogSec=15s
-RebootWatchdogSec=2min
-WD
-cat > /etc/sysctl.d/98-autoreboot.conf << 'KP'
-kernel.panic = 10
-kernel.panic_on_oops = 1
-KP
-sysctl --system >/dev/null
-CMDLINE=/boot/firmware/cmdline.txt
-if [ -f "$CMDLINE" ] && ! grep -q 'fsck.repair' "$CMDLINE"; then
-  sed -i '1 s/$/ fsck.mode=auto fsck.repair=yes/' "$CMDLINE"
-fi
-mkdir -p /etc/systemd/journald.conf.d
-cat > /etc/systemd/journald.conf.d/size.conf << 'JR'
-[Journal]
-Storage=persistent
-SystemMaxUse=300M
-JR
-systemctl restart systemd-journald
-
-if [ "$INSTALL_ARGON" = "yes" ]; then
-  step "Вентилятор Argon ONE"
-  # I2C потрібен для керування вентилятором
-  CFG=/boot/firmware/config.txt
-  grep -q '^dtparam=i2c_arm=on' "$CFG" || echo 'dtparam=i2c_arm=on' >> "$CFG"
-  echo i2c-dev > /etc/modules-load.d/i2c-dev.conf
-  modprobe i2c-dev 2>/dev/null || true
-  chmod 755 /usr/local/bin/argon-fan /usr/local/bin/argon-check /usr/local/bin/argon-fan-test
-
-  # Офіційний драйвер Argon40
-  if curl -fsSL https://download.argon40.com/argon1.sh -o /tmp/argon1.sh; then
-    timeout 900 bash /tmp/argon1.sh < /dev/null || echo "!!! Офіційний драйвер встановився з помилкою"
-  else
-    echo "!!! Не вдалося завантажити офіційний драйвер"
-  fi
-
-  # Якщо офіційний не з'явився, одразу вмикаємо запасний
-  if [ -f /lib/systemd/system/argononed.service ] || [ -f /etc/systemd/system/argononed.service ]; then
-    echo "Офіційний драйвер встановлено"
-  else
-    echo "Офіційного драйвера немає, вмикаю запасний argon-fan"
-    systemctl enable argon-fan
-  fi
-  # При кожному старті перевіряємо, що вентилятором щось керує
-  systemctl daemon-reload
-  systemctl enable argon-check
-fi
-
-step "Прибирання"
-printf '#cloud-config\n# Налаштування застосовано, файл очищено.\n' > /boot/firmware/user-data
-touch "$MARK"
-
-step "ГОТОВО. Перезавантаження через 1 хвилину"
-shutdown -r +1 "pi-setup: фінальне перезавантаження"
+exec bash "$REPO_DIR/scripts/firstboot.sh"
 BOOT
 chmod 700 "$MR/opt/pi-setup/bootstrap.sh"
 
-cat > "$MR/usr/local/bin/server-status" << 'ST'
-#!/usr/bin/env bash
-echo "== Система ==";   hostname; uptime -p; df -h / | tail -1; free -h | sed -n 2p
-[ -r /sys/class/thermal/thermal_zone0/temp ] && echo "CPU: $(( $(cat /sys/class/thermal/thermal_zone0/temp) / 1000 ))°C"
-echo; echo "== Мережа =="; ip -4 -br addr | grep -v '^lo'
-echo; echo "== Файрвол ==";  sudo ufw status
-echo; echo "== fail2ban (SSH) =="; sudo fail2ban-client status sshd | grep -E "Currently|Total"
-echo; echo "== Вентилятор Argon =="
-if systemctl is-active --quiet argononed 2>/dev/null; then echo "офіційний драйвер працює"
-elif systemctl is-active --quiet argon-fan 2>/dev/null; then echo "запасний драйвер працює"
-else echo "НЕ ПРАЦЮЄ (перевір: argon-fan-test)"; fi
-if command -v docker >/dev/null; then echo; echo "== Контейнери =="; docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"; fi
-ST
+# Запуск через systemd, а не cloud-init runcmd: runcmd виконується лише раз
+# і після нечистого вимкнення може лишитись порожнім. Сервіс повторює спробу
+# при кожному старті, поки не з'явиться /opt/pi-setup/.done.
+cat > "$MR/etc/systemd/system/pi-setup.service" << 'PSVC'
+[Unit]
+Description=pi-setup: first boot configuration
+After=cloud-final.service network-online.target
+Wants=network-online.target
+ConditionPathExists=!/opt/pi-setup/.done
 
-cat > "$MR/usr/local/bin/server-update" << 'UPD'
-#!/usr/bin/env bash
-set -euo pipefail
-sudo apt-get update && sudo apt-get -y full-upgrade && sudo apt-get -y autoremove
-if command -v docker >/dev/null; then docker image prune -f; fi
-if [ -f /var/run/reboot-required ]; then echo "Потрібне перезавантаження: sudo reboot"; else echo "Готово"; fi
-UPD
-chmod 755 "$MR/usr/local/bin/server-status" "$MR/usr/local/bin/server-update" \
-          "$MR/usr/local/bin/argon-fan" "$MR/usr/local/bin/argon-check" "$MR/usr/local/bin/argon-fan-test"
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/pi-setup/bootstrap.sh
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+PSVC
+mkdir -p "$MR/etc/systemd/system/multi-user.target.wants"
+ln -sf /etc/systemd/system/pi-setup.service "$MR/etc/systemd/system/multi-user.target.wants/pi-setup.service"
 
 sync
 umount "$MB" "$MR"
@@ -675,5 +437,7 @@ echo -e "${B}Далі:${NC}"
 echo "  1. sudo reboot   (EEPROM оновиться, Pi стартує з SSD)"
 echo "  2. Зачекай 10–20 хв: ставляться пакети, в кінці Pi сам перезавантажиться ще раз"
 echo "  3. ssh ${NEW_USER}@${HOST}.local  або  ssh ${NEW_USER}@<IP Pi>"
-echo "  4. server-status      і перевір вентилятор:  argon-fan-test"
+echo "  4. server-status     і перевір вентилятор:  argon-fan-test"
 echo "  5. Можна вимкнути Pi і витягти microSD"
+echo
+echo "  Лог встановлення на сервері: /var/log/pi-setup.log"

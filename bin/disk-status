@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# disk-status — health overview of the network drive (Samba share on a loop image).
+#
+# Usage:  disk-status        full report (run with sudo to see connected clients)
+#         disk-status -q     no output, exit code only: 0 = healthy, 1 = problem
+#
+# Read-only: never writes, installs or uploads anything.
+
+[ "${1:-}" = "-q" ] && QUIET=1
+UI=${PI_UI:-/usr/local/lib/pi-server/ui.sh}
+[ -r "$UI" ] || UI="$(dirname "$(readlink -f "$0")")/lib/ui.sh"
+if [ ! -r "$UI" ]; then
+    echo "Немає бібліотеки оформлення ui.sh."
+    echo "Встанови команди заново:  sudo bash /opt/pi-server/scripts/install-commands.sh"
+    exit 1
+fi
+# shellcheck source=lib/ui.sh
+. "$UI"
+
+# Values match scripts/setup-share.sh; override with env vars if you renamed things.
+MOUNT=${SHARE_MOUNT:-/srv/share}
+IMAGE=${SHARE_IMAGE:-/srv/images/share.img}
+SHARE=${SHARE_NAME:-Workplace}
+
+title "$SHARE" "мережевий диск"
+
+row info "Адреса" "${B}\\\\$(hostname)\\${SHARE}${N}"
+row info "Папка" "${DIM}${MOUNT}${N}"
+hr
+
+# Everything below depends on the image being mounted.
+if findmnt -n "$MOUNT" >/dev/null 2>&1; then
+    row ok   "Змонтований" "$(findmnt -n -o SOURCE,FSTYPE "$MOUNT" | tr -s ' ')"
+else
+    row fail "Змонтований" "ні — sudo mount -a"
+fi
+
+if [ -d "$MOUNT" ]; then
+    read -r SIZE USED AVAIL PCT <<<"$(df -h --output=size,used,avail,pcent "$MOUNT" | tail -1)"
+    PCTNUM=${PCT%\%}
+    row "$(state_for "$PCTNUM")" "Зайнято" "$(bar "$PCTNUM")  ${B}${USED}${N} з ${SIZE}${DIM}, вільно ${AVAIL}${N}"
+fi
+
+if systemctl is-active --quiet smbd; then
+    row ok   "Samba" "працює${DIM}, з $(systemctl show -p ActiveEnterTimestamp --value smbd | cut -d' ' -f2-3)${N}"
+else
+    row fail "Samba" "зупинена — sudo systemctl start smbd"
+fi
+
+# The share must stay reachable from the LAN only.
+if [ -n "$SUDO" ] && command -v ufw >/dev/null 2>&1; then
+    if $SUDO ufw status 2>/dev/null | grep -q '445.*ALLOW'; then
+        row ok   "Файрвол" "445/tcp дозволено з локальної мережі"
+    else
+        row warn "Файрвол" "правила для 445 немає"
+    fi
+else
+    row info "Файрвол" "${DIM}потрібен sudo для перевірки${N}"
+fi
+
+hr
+
+# smbstatus needs root; without it the rest of the report still works.
+if SMB=$($SUDO smbstatus -b 2>/dev/null); then
+    CLIENTS=$(echo "$SMB" | awk '/^[0-9]/ {print $2" @ "$5}' | sort -u | grep -c . || true)
+    if [ "${CLIENTS:-0}" -gt 0 ]; then
+        row ok "Підключення" "${CLIENTS} активних"
+        [ "$QUIET" = 0 ] && echo "$SMB" | awk '/^[0-9]/ {print $2" @ "$5}' | sort -u \
+            | while read -r line; do sub "$line"; done
+    else
+        row info "Підключення" "${DIM}зараз ніхто не підключений${N}"
+    fi
+    OPEN=$($SUDO smbstatus -L 2>/dev/null | grep -c 'DENY_' || true)
+    [ "${OPEN:-0}" -gt 0 ] && row info "Відкриті файли" "$OPEN"
+else
+    row info "Підключення" "${DIM}запусти з sudo, щоб побачити${N}"
+fi
+
+hr
+
+# lost+found is hidden from Windows by smb.conf, so skip it here too.
+if [ -d "$MOUNT" ]; then
+    FILES=$(find "$MOUNT" -path "$MOUNT/lost+found" -prune -o -type f -print 2>/dev/null | wc -l)
+    DIRS=$(find  "$MOUNT" -path "$MOUNT/lost+found" -prune -o -type d -print 2>/dev/null | wc -l)
+    row info "Вміст" "$FILES файлів у $(( DIRS > 0 ? DIRS - 1 : 0 )) папках"
+
+    NEWEST=$(find "$MOUNT" -path "$MOUNT/lost+found" -prune -o -type f \
+             -printf '%T@ %TY-%Tm-%Td %TH:%TM %p\n' 2>/dev/null | sort -rn | head -1)
+    if [ -n "$NEWEST" ]; then
+        row info "Останній запис" "$(echo "$NEWEST" | cut -d' ' -f2-3)  ${DIM}$(basename "$(echo "$NEWEST" | cut -d' ' -f4-)")${N}"
+    fi
+
+    if [ "$QUIET" = 0 ] && [ "$FILES" -gt 0 ]; then
+        say "${DIM}    найбільші:${N}"
+        du -sh "$MOUNT"/* 2>/dev/null | grep -v 'lost+found' | sort -rh | head -3 \
+            | while read -r size path; do printf '    %s· %-6s %s%s\n' "$DIM" "$size" "$(basename "$path")" "$N"; done
+    fi
+fi
+
+# The image lives on the SSD: if the SSD fills up, writes here fail too.
+[ -f "$IMAGE" ] && row info "Образ" "${DIM}$IMAGE ($(du -h "$IMAGE" | cut -f1))${N}"
+
+verdict "Диск працює" "Є проблеми — дивись рядки з ✖"

@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# bookmarks-status — health overview of the self-hosted Linkwarden instance.
+#
+# Usage:  bookmarks-status        full report
+#         bookmarks-status -q     no output, exit code only: 0 = healthy, 1 = problem
+#
+# Read-only: reads container state, HTTP endpoints and row counts.
+
+[ "${1:-}" = "-q" ] && QUIET=1
+UI=${PI_UI:-/usr/local/lib/pi-server/ui.sh}
+[ -r "$UI" ] || UI="$(dirname "$(readlink -f "$0")")/lib/ui.sh"
+if [ ! -r "$UI" ]; then
+    echo "Немає бібліотеки оформлення ui.sh."
+    echo "Встанови команди заново:  sudo bash /opt/pi-server/scripts/install-commands.sh"
+    exit 1
+fi
+# shellcheck source=lib/ui.sh
+. "$UI"
+
+APP=${LINKWARDEN_DIR:-/srv/apps/linkwarden}
+PORT=${LINKWARDEN_PORT:-3000}
+DB_CONTAINER=linkwarden-db
+
+cd "$APP" 2>/dev/null || { echo "bookmarks-status: $APP не знайдено"; exit 1; }
+
+# NEXTAUTH_URL виглядає як https://host:8443/api/v1/auth — відрізаємо хвіст
+AUTH=$(grep -m1 '^NEXTAUTH_URL=' .env 2>/dev/null | cut -d= -f2-)
+URL=${AUTH%/api/v1/auth}
+
+title "LINKWARDEN" "закладки"
+
+if [ -n "$URL" ]; then
+    row info "Адреса" "${B}${URL}${N}"
+else
+    row warn "Адреса" "не задана в .env"
+fi
+hr
+
+STATUS=$(docker ps --filter name=^linkwarden$ --format '{{.Status}}' 2>/dev/null)
+if [ -n "$STATUS" ]; then
+    row ok   "Застосунок" "$STATUS"
+else
+    row fail "Застосунок" "не запущений — docker compose up -d"
+fi
+
+DBSTATUS=$(docker ps --filter "name=^${DB_CONTAINER}$" --format '{{.Status}}' 2>/dev/null)
+if [ -n "$DBSTATUS" ]; then
+    row ok   "База" "$DBSTATUS"
+else
+    row fail "База" "PostgreSQL не запущений"
+fi
+
+# Local check proves the app is alive regardless of Tailscale.
+CODE=$(curl -s -m 8 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/" 2>/dev/null)
+case "$CODE" in
+    200|302|307) row ok   "Локально" "відповідає на 127.0.0.1:${PORT}" ;;
+    *)           row fail "Локально" "код ${CODE:-—} — docker compose logs --tail 40" ;;
+esac
+
+if tailscale serve status 2>/dev/null | grep -q "127.0.0.1:${PORT}"; then
+    row ok   "Tailscale" "проксі активний"
+else
+    row fail "Tailscale" "не налаштований — sudo tailscale serve --bg --https=8443 ${PORT}"
+fi
+
+if [ -n "$URL" ]; then
+    CODE=$(curl -s -m 12 -o /dev/null -w '%{http_code}' "$URL/" 2>/dev/null)
+    case "$CODE" in
+        200|302|307) row ok   "HTTPS ззовні" "сертифікат дійсний" ;;
+        *)           row fail "HTTPS ззовні" "код ${CODE:-—}, перевір tailscale serve status" ;;
+    esac
+fi
+
+# Registration must be closed once your account exists.
+REG=$(grep -m1 '^NEXT_PUBLIC_DISABLE_REGISTRATION=' .env 2>/dev/null | cut -d= -f2-)
+case "$REG" in
+    true) row ok   "Реєстрація" "закрита" ;;
+    *)    row warn "Реєстрація" "ВІДКРИТА — постав true в .env і docker compose up -d" ;;
+esac
+
+# Counts straight from PostgreSQL: what is actually stored here.
+if [ -n "$DBSTATUS" ]; then
+    LINKS=$(docker exec "$DB_CONTAINER" psql -U postgres -tAc 'select count(*) from "Link"' 2>/dev/null)
+    COLS=$(docker  exec "$DB_CONTAINER" psql -U postgres -tAc 'select count(*) from "Collection"' 2>/dev/null)
+    TAGS=$(docker  exec "$DB_CONTAINER" psql -U postgres -tAc 'select count(*) from "Tag"' 2>/dev/null)
+    [ -n "$LINKS" ] && row info "Закладок" "${B}${LINKS}${N}${DIM}, колекцій: ${COLS:-0}, тегів: ${TAGS:-0}${N}"
+fi
+
+# Archived copies grow fast: every saved page keeps a screenshot and a PDF.
+[ -d "$APP/data" ] && row info "Архіви сторінок" "${DIM}$(du -sh "$APP/data" 2>/dev/null | cut -f1)${N}"
+
+STATS=$(docker stats --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}' linkwarden "$DB_CONTAINER" 2>/dev/null \
+        | awk -F'|' '{cpu+=$1; print}' | head -2)
+if [ -n "$STATS" ]; then
+    MEMS=$(echo "$STATS" | cut -d'|' -f2 | cut -d' ' -f1 | paste -sd'+' -)
+    row info "Ресурси" "${DIM}застосунок + база: ${MEMS}${N}"
+fi
+
+LAST=$(ls -1t /srv/backup/linkwarden/*.tar.gz 2>/dev/null | head -1)
+if [ -n "$LAST" ]; then
+    AGE=$(( ( $(date +%s) - $(stat -c %Y "$LAST") ) / 86400 ))
+    DESC="$(date -r "$LAST" '+%F %H:%M'), $(du -h "$LAST" | cut -f1)"
+    if [ "$AGE" -le 2 ]; then row ok "Бекап" "$DESC"; else row warn "Бекап" "$DESC — $AGE дн. тому"; fi
+else
+    row warn "Бекап" "не налаштований — docs/backups.md"
+fi
+
+verdict "Все працює" "Є проблеми — дивись рядки з ✖"

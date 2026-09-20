@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Перевірка вентилятора: 100% на 5 секунд, потім повертаємо керування драйверу
+[ "$EUID" -eq 0 ] || exec sudo "$0" "$@"
+echo "I2C пристрої на шині 1 (має бути 1a):"
+i2cdetect -y 1 | grep -E "^10:|1a" || true
+systemctl stop argononed argon-fan 2>/dev/null
+echo "Вентилятор 100% на 5 секунд..."
+python3 -c "import smbus; smbus.SMBus(1).write_byte(0x1a, 100)" && sleep 5
+python3 -c "import smbus; smbus.SMBus(1).write_byte(0x1a, 0)"
+systemctl start argon-check >/dev/null 2>&1 &
+echo "Якщо вентилятор загудів, усе працює. Керування повернеться драйверу за хвилину."
+TEST

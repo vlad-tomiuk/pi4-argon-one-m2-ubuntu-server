@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# server-update — update the system, the containers and the server's own commands.
+#
+# Usage:  server-update            system + docker images
+#         server-update --self     also pull this repo and reinstall bin/* commands
+
+set -euo pipefail
+
+REPO=${PI_SERVER_REPO:-/opt/pi-server}
+
+echo "== Система =="
+sudo apt-get update
+sudo apt-get -y full-upgrade
+sudo apt-get -y autoremove
+
+if command -v docker >/dev/null; then
+    echo
+    echo "== Контейнери =="
+    # Update every app that has a compose file under /srv/apps/*
+    for dir in /srv/apps/*/; do
+        [ -f "$dir/docker-compose.yml" ] || continue
+        echo "-- $(basename "$dir")"
+        (cd "$dir" && sudo docker compose pull -q && sudo docker compose up -d)
+    done
+    sudo docker image prune -f >/dev/null
+fi
+
+if [ "${1:-}" = "--self" ]; then
+    echo
+    echo "== Команди сервера =="
+    if [ -d "$REPO/.git" ]; then
+        sudo git -C "$REPO" pull --ff-only
+        sudo bash "$REPO/scripts/install-commands.sh"
+    else
+        echo "Репозиторій не знайдено в $REPO — пропускаю"
+    fi
+fi
+
+echo
+if [ -f /var/run/reboot-required ]; then
+    echo "Потрібне перезавантаження: sudo reboot"
+else
+    echo "Готово"
+fi

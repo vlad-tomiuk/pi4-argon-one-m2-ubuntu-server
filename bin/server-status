@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# server-status — one-screen health and security audit of the server.
+#
+# Usage:  server-status        full report (run with sudo to see firewall and sessions)
+#         server-status -q     no output, exit code only: 0 = healthy, 1 = problem
+#
+# Read-only: never writes, installs or uploads anything.
+
+[ "${1:-}" = "-q" ] && QUIET=1
+UI=${PI_UI:-/usr/local/lib/pi-server/ui.sh}
+[ -r "$UI" ] || UI="$(dirname "$(readlink -f "$0")")/lib/ui.sh"
+if [ ! -r "$UI" ]; then
+    echo "Немає бібліотеки оформлення ui.sh."
+    echo "Встанови команди заново:  sudo bash /opt/pi-server/scripts/install-commands.sh"
+    exit 1
+fi
+# shellcheck source=lib/ui.sh
+. "$UI"
+
+# ---------- header ----------
+
+title "$(hostname)" "$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+
+FROM=$(who am i 2>/dev/null | awk '{gsub(/[()]/,"",$5); print $5}')
+row info "Користувач" "${B}$(whoami)${N}${DIM}${FROM:+ (вхід з $FROM)}${N}"
+row info "Працює" "$(uptime -p | sed 's/^up //')${DIM}, з $(uptime -s)${N}"
+row info "Процеси" "$(ps -e --no-headers | wc -l) шт.${DIM}, сесій: $(who | wc -l)${N}"
+
+# ---------- load ----------
+
+section "Навантаження"
+
+# Load average is per-core here: 100% means every core is busy.
+CORES=$(nproc)
+read -r L1 L5 L15 _ </proc/loadavg
+LPCT=$(awk -v l="$L1" -v c="$CORES" 'BEGIN{printf "%d", l/c*100}')
+row "$(state_for "$LPCT")" "CPU" "$(bar "$LPCT")  ${B}${LPCT}%${N}${DIM}  (${L1} / ${L5} / ${L15} на ${CORES} ядра)${N}"
+
+# "available" is the honest number; cached memory is not a leak.
+read -r MTOTAL MUSED MAVAIL < <(free -m | awk '/^Mem:/{print $2, $3, $7}')
+MPCT=$(( (MTOTAL - MAVAIL) * 100 / MTOTAL ))
+row "$(state_for "$MPCT")" "Пам'ять" "$(bar "$MPCT")  ${B}${MPCT}%${N}${DIM}  (зайнято ${MUSED}M з ${MTOTAL}M, вільно ${MAVAIL}M)${N}"
+row info "Swap" "${DIM}$(free -m | awk '/^Swap:/{if ($2>0) printf "%d/%dM", $3, $2; else print "вимкнено"}')${N}"
+
+if [ -r /sys/class/thermal/thermal_zone0/temp ]; then
+    TEMP=$(( $(cat /sys/class/thermal/thermal_zone0/temp) / 1000 ))
+    TSTATE=ok; TNOTE="норма"
+    [ "$TEMP" -ge 70 ] && TSTATE=warn && TNOTE="гаряче"
+    [ "$TEMP" -ge 80 ] && TSTATE=fail && TNOTE="тротлінг"
+    row "$TSTATE" "Температура" "${B}${TEMP}°C${N}${DIM} — ${TNOTE}${N}"
+fi
+
+# Undervoltage history: the classic cause of random Pi freezes.
+# Needs access to /dev/vcio, so without sudo (or the video group) it just says so
+# instead of mistaking the error text for a reading.
+if command -v vcgencmd >/dev/null 2>&1; then
+    TH=$($SUDO vcgencmd get_throttled 2>/dev/null | cut -d= -f2)
+    case "$TH" in
+        0x0)                  row ok   "Живлення" "проблем не було" ;;
+        0x[0-9a-fA-F]*)       row warn "Живлення" "були просідання або перегрів ($TH)" ;;
+        *)                    row info "Живлення" "${DIM}дані недоступні без sudo${N}" ;;
+    esac
+fi
+
+# ---------- disks ----------
+
+section "Диски"
+
+while read -r SIZE USED AVAIL PCT TARGET; do
+    PCTNUM=${PCT%\%}
+    case "$TARGET" in
+        /)              NAME="Система" ;;
+        /srv/share)     NAME="Диск W:" ;;
+        /srv/backup)    NAME="Бекапи" ;;
+        /boot/firmware) continue ;;
+        *)              NAME="$TARGET" ;;
+    esac
+    row "$(state_for "$PCTNUM")" "$NAME" "$(bar "$PCTNUM")  ${B}${USED}${N} з ${SIZE}${DIM}, вільно ${AVAIL}${N}"
+done < <(df -h --output=size,used,avail,pcent,target -x tmpfs -x devtmpfs -x squashfs -x overlay 2>/dev/null | tail -n +2)
+
+# The card is optional: the system boots from SSD, the card only stores backups.
+if lsblk -dn -o NAME 2>/dev/null | grep -q '^mmcblk0$'; then
+    SDSIZE=$(lsblk -dn -o SIZE /dev/mmcblk0 | tr -d ' ')
+    if findmnt -n /srv/backup >/dev/null 2>&1; then
+        row ok   "microSD" "${SDSIZE}, змонтована в /srv/backup"
+    else
+        row warn "microSD" "${SDSIZE}, вставлена але не змонтована"
+    fi
+else
+    row info "microSD" "${DIM}не вставлена${N}"
+fi
+
+[ "$QUIET" = 0 ] && lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS -e 7 2>/dev/null \
+    | tail -n +2 | while read -r line; do sub "$line"; done
+
+# ---------- security ----------
+
+section "Захист"
+
+if command -v ufw >/dev/null 2>&1; then
+    UFW=$($SUDO ufw status 2>/dev/null | head -1)
+    if echo "$UFW" | grep -q active; then
+        row ok   "Файрвол" "увімкнений${DIM}, правил: $($SUDO ufw status numbered 2>/dev/null | grep -c '^\[')${N}"
+    elif [ -n "$UFW" ]; then
+        row fail "Файрвол" "ВИМКНЕНИЙ — sudo ufw enable"
+    else
+        row info "Файрвол" "${DIM}потрібен sudo для перевірки${N}"
+    fi
+fi
+
+if systemctl is-active --quiet fail2ban 2>/dev/null; then
+    F2B=$($SUDO fail2ban-client status sshd 2>/dev/null)
+    if [ -n "$F2B" ]; then
+        BANNED=$(echo "$F2B" | awk -F'\t' '/Currently banned/{print $2}' | tr -d ' ')
+        TRIES=$(echo  "$F2B" | awk -F'\t' '/Total failed/{print $2}'      | tr -d ' ')
+        row ok "fail2ban" "працює${DIM}, забанено: ${BANNED:-0}, невдалих спроб: ${TRIES:-0}${N}"
+    else
+        row ok "fail2ban" "працює"
+    fi
+else
+    row fail "fail2ban" "не працює"
+fi
+
+if [ -f /etc/ssh/sshd_config.d/10-hardening.conf ]; then
+    row ok   "SSH" "захищений${DIM} (root заборонений, пароль лише з LAN)${N}"
+else
+    row warn "SSH" "немає посилених налаштувань"
+fi
+
+if systemctl is-enabled --quiet unattended-upgrades 2>/dev/null; then
+    row ok   "Оновлення" "безпекові ставляться автоматично"
+else
+    row warn "Оновлення" "автооновлення вимкнені"
+fi
+
+[ -f /var/run/reboot-required ] && row warn "Перезавантаження" "потрібне після оновлень — sudo reboot"
+
+if command -v tailscale >/dev/null 2>&1; then
+    TSIP=$(tailscale ip -4 2>/dev/null | head -1)
+    if [ -n "$TSIP" ]; then
+        row ok   "Tailscale" "${TSIP}${DIM}, пристроїв у мережі: $(tailscale status 2>/dev/null | grep -c .)${N}"
+    else
+        row warn "Tailscale" "не підключений — sudo tailscale up"
+    fi
+fi
+
+# ---------- who is connected ----------
+
+section "Підключення"
+
+SESSIONS=$(who | wc -l)
+if [ "$SESSIONS" -gt 0 ]; then
+    row info "SSH-сесії" "$SESSIONS"
+    [ "$QUIET" = 0 ] && who | while read -r u _ date time from; do
+        sub "$u  $date $time  ${from//[()]/}"
+    done
+fi
+
+# Sockets listening beyond loopback are the actual attack surface.
+if [ "$QUIET" = 0 ]; then
+    EXPOSED=$(ss -tulnH 2>/dev/null | awk '{print $1, $5}' | grep -vE '127\.0\.0\.1|\[::1\]' | sort -u)
+    if [ -n "$EXPOSED" ]; then
+        row info "Слухають порти" "${DIM}(видно з мережі)${N}"
+        echo "$EXPOSED" | while read -r proto addr; do sub "$proto  $addr"; done
+    fi
+fi
+
+# ---------- docker ----------
+
+if command -v docker >/dev/null 2>&1; then
+    section "Контейнери"
+    RUNNING=$(docker ps -q 2>/dev/null | wc -l)
+    if [ "$RUNNING" -gt 0 ]; then
+        row ok "Запущено" "$RUNNING${DIM}, зупинено: $(docker ps -aq --filter status=exited 2>/dev/null | wc -l)${N}"
+        [ "$QUIET" = 0 ] && docker ps --format '{{.Names}}  {{.Status}}  {{.Ports}}' 2>/dev/null \
+            | while read -r line; do sub "$line"; done
+    else
+        row info "Запущено" "${DIM}жодного${N}"
+    fi
+fi
+
+# ---------- fan ----------
+
+section "Вентилятор Argon"
+
+if systemctl is-active --quiet argononed 2>/dev/null; then
+    row ok   "Драйвер" "офіційний працює"
+elif systemctl is-active --quiet argon-fan 2>/dev/null; then
+    row ok   "Драйвер" "запасний працює"
+else
+    row fail "Драйвер" "не працює — перевір: argon-fan-test"
+fi
+
+# ---------- ssh keys ----------
+
+section "SSH-ключі"
+
+# Every key listed here can log in without a password. Reading another user's
+# authorized_keys needs root, so without sudo we show only what is readable.
+KEYS_TOTAL=0
+KEY_LINES=""
+for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+    [ -e "$f" ] || continue
+    owner=$(echo "$f" | awk -F/ '{print ($2=="root") ? "root" : $3}')
+    while IFS= read -r line; do
+        case "$line" in ''|\#*) continue ;; esac
+        # ssh-keygen prints: "256 SHA256:xxxx comment (ED25519)"
+        info=$(ssh-keygen -lf - <<< "$line" 2>/dev/null) || continue
+        fp=$(echo "$info" | awk '{print $2}')
+        type=$(echo "$info" | awk '{print $NF}' | tr -d '()')
+        comment=$(echo "$info" | cut -d' ' -f3- | sed 's/ ([^)]*)$//')
+        [ "$comment" = "no comment" ] && comment="без підпису"
+        KEYS_TOTAL=$((KEYS_TOTAL + 1))
+        KEY_LINES+="${owner}|${type}|${comment}|${fp:0:26}…"$'\n'
+    done < <($SUDO cat "$f" 2>/dev/null)
+done
+
+if [ "$KEYS_TOTAL" -gt 0 ]; then
+    row ok "Ключів" "$KEYS_TOTAL${DIM} — вхід без пароля${N}"
+    [ "$QUIET" = 0 ] && printf '%s' "$KEY_LINES" | while IFS='|' read -r o t c f; do
+        [ -n "$o" ] && sub "$(printf '%-8s %-8s %-28s %s' "$o" "$t" "$c" "$f")"
+    done
+elif [ -n "$SUDO" ]; then
+    row warn "Ключів" "немає — працює лише пароль з локальної мережі"
+else
+    row info "Ключі" "${DIM}потрібен sudo, щоб побачити всі${N}"
+fi
+
+# ---------- hints ----------
+
+if [ "$QUIET" = 0 ]; then
+    section "Корисні команди"
+    sub "disk-status                мережевий диск"
+    sub "password-status            менеджер паролів"
+    sub "server-update              оновити систему"
+    sub "htop                       процеси наживо"
+    sub "docker stats               навантаження контейнерів"
+    sub "journalctl -p err -n 50    останні помилки системи"
+    sub "sudo ufw status numbered   правила файрвола"
+fi
+
+verdict "Сервер здоровий" "Є проблеми — дивись рядки з ✖"
