@@ -67,6 +67,13 @@ echo
 echo "== Samba =="
 command -v smbd >/dev/null || { apt-get update -qq; apt-get install -y -qq samba; }
 
+# NetBIOS (137/138) потрібен лише клієнтам часів Windows 98; сучасні ходять по 445.
+# Вимикаємо, щоб не тримати зайві відкриті порти. SMB1 теж лишається позаду.
+if ! grep -q '^   disable netbios = yes' /etc/samba/smb.conf; then
+    sed -i '/^\[global\]/a\   disable netbios = yes\n   smb ports = 445\n   server min protocol = SMB2' /etc/samba/smb.conf
+    echo "NetBIOS вимкнено, мінімальний протокол SMB2"
+fi
+
 if grep -q "^\[$NAME\]" /etc/samba/smb.conf; then
     echo "Секція [$NAME] уже є в smb.conf (пропускаю)"
 else
