@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# timetracker-status — health overview of the self-hosted solidtime instance
+# plus hours tracked this month per client.
+#
+# Usage:  timetracker-status        full report
+#         timetracker-status -q     no output, exit code only: 0 = healthy, 1 = problem
+#
+# Read-only: reads container state, HTTP endpoints and aggregates from the database.
+
+[ "${1:-}" = "-q" ] && QUIET=1
+UI=${PI_UI:-/usr/local/lib/pi-server/ui.sh}
+[ -r "$UI" ] || UI="$(dirname "$(readlink -f "$0")")/lib/ui.sh"
+if [ ! -r "$UI" ]; then
+    echo "Немає бібліотеки оформлення ui.sh."
+    echo "Встанови команди заново:  sudo bash /opt/pi-server/scripts/install-commands.sh"
+    exit 1
+fi
+# shellcheck source=lib/ui.sh
+. "$UI"
+
+APP=${SOLIDTIME_DIR:-/srv/apps/solidtime}
+PORT=${SOLIDTIME_PORT:-8000}
+# Monthly hour budget per client: the gauge fills towards this number.
+HOURS_LIMIT=${HOURS_LIMIT:-80}
+DB_CONTAINER=solidtime-db
+
+cd "$APP" 2>/dev/null || { echo "timetracker-status: $APP не знайдено"; exit 1; }
+
+URL=$(grep -m1 '^APP_URL=' .env 2>/dev/null | cut -d= -f2- | tr -d '"')
+URL=${URL%/}
+
+title "SOLIDTIME" "трекер часу"
+
+if [ -n "$URL" ]; then
+    row info "Адреса" "${B}${URL}${N}"
+else
+    row warn "Адреса" "не задана в .env"
+fi
+hr
+
+# Three roles of one image: web, scheduler, queue worker. All must be up.
+for pair in "solidtime|Застосунок" "solidtime-scheduler|Планувальник" "solidtime-queue|Черга" \
+            "solidtime-db|База" "solidtime-gotenberg|PDF"; do
+    name=${pair%%|*}; label=${pair#*|}
+    STATUS=$(docker ps --filter "name=^${name}$" --format '{{.Status}}' 2>/dev/null)
+    if [ -n "$STATUS" ]; then
+        case "$STATUS" in
+            *unhealthy*) row fail "$label" "$STATUS — docker compose logs --tail 40 ${name#solidtime-}" ;;
+            *)           row ok   "$label" "$STATUS" ;;
+        esac
+    elif [ "$name" = solidtime-gotenberg ]; then
+        row warn "$label" "не запущений — експорт у PDF не працюватиме"
+    else
+        row fail "$label" "не запущений — docker compose up -d"
+    fi
+done
+DBUP=$(docker ps --filter "name=^${DB_CONTAINER}$" --format '{{.Names}}' 2>/dev/null)
+
+# Local check proves the app is alive regardless of Tailscale.
+CODE=$(curl -s -m 8 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/health-check/up" 2>/dev/null)
+case "$CODE" in
+    200) row ok   "Локально" "відповідає на 127.0.0.1:${PORT}" ;;
+    *)   row fail "Локально" "код ${CODE:-—} — docker compose logs --tail 40 solidtime" ;;
+esac
+
+if tailscale serve status 2>/dev/null | grep -q "127.0.0.1:${PORT}"; then
+    row ok   "Tailscale" "проксі активний"
+else
+    row fail "Tailscale" "не налаштований — sudo tailscale serve --service=svc:time --bg ${PORT}"
+fi
+
+if [ -n "$URL" ]; then
+    CODE=$(curl -s -m 12 -o /dev/null -w '%{http_code}' "$URL/health-check/up" 2>/dev/null)
+    case "$CODE" in
+        200) row ok   "HTTPS ззовні" "сертифікат дійсний" ;;
+        *)   row fail "HTTPS ззовні" "код ${CODE:-—}, перевір tailscale serve status" ;;
+    esac
+fi
+
+# Keys are appended by self-host:generate-keys; without them nobody can log in.
+if grep -q '^APP_KEY="base64:' .env 2>/dev/null && grep -q '^PASSPORT_PRIVATE_KEY="-----BEGIN' .env 2>/dev/null; then
+    row ok   "Ключі" "APP_KEY і Passport на місці"
+else
+    row fail "Ключі" "немає в .env — docs/timetracking.md, крок 1"
+fi
+
+psql_q() { docker exec "$DB_CONTAINER" psql -U solidtime -d solidtime -tAF'|' -c "$1" 2>/dev/null; }
+
+if [ -n "$DBUP" ]; then
+    USERS=$(psql_q "select count(*) from users where is_placeholder = false")
+    CLIENTS=$(psql_q "select count(*) from clients where archived_at is null")
+    PROJECTS=$(psql_q "select count(*) from projects where archived_at is null")
+    TASKS=$(psql_q "select count(*) from tasks where done_at is null")
+    ENTRIES=$(psql_q "select count(*) from time_entries")
+    if [ -n "$USERS" ]; then
+        [ "$USERS" = 0 ] && row warn "Акаунт" "ще не створений — docs/timetracking.md, крок 3"
+        row info "Дані" "${DIM}клієнтів: ${CLIENTS:-0}, проєктів: ${PROJECTS:-0}, відкритих задач: ${TASKS:-0}, записів: ${ENTRIES:-0}${N}"
+    fi
+
+    # start/end are stored in UTC; the month boundary follows the server's timezone.
+    TZNAME=$(timedatectl show -p Timezone --value 2>/dev/null)
+    TZNAME=${TZNAME:-Europe/Kyiv}
+    MONTH_START="(date_trunc('month', now() at time zone '$TZNAME') at time zone '$TZNAME') at time zone 'UTC'"
+
+    RUNNING=$(psql_q "select coalesce(p.name, '—'), coalesce(t.description, ''),
+                             to_char(now() at time zone 'UTC' - e.start, 'HH24:MI')
+                      from time_entries e
+                      left join projects p on p.id = e.project_id
+                      left join tasks t on t.id = e.task_id
+                      where e.\"end\" is null limit 1")
+    if [ -n "$RUNNING" ]; then
+        IFS='|' read -r rp rt rd <<< "$RUNNING"
+        row info "Таймер" "${B}іде ${rd}${N}${DIM} — ${rp}${rt:+ · $rt}${N}"
+    fi
+
+    HOURS=$(psql_q "select coalesce(c.name, 'без клієнта'),
+                           round(sum(extract(epoch from coalesce(e.\"end\", now() at time zone 'UTC') - e.start)) / 3600.0, 1)
+                    from time_entries e
+                    left join clients c on c.id = e.client_id
+                    where e.start >= $MONTH_START
+                    group by 1 order by 2 desc")
+    if [ -n "$HOURS" ] && [ "$QUIET" = 0 ]; then
+        section "Години за $(date +%m.%Y) (ліміт ${HOURS_LIMIT} год)"
+        while IFS='|' read -r client hours; do
+            [ -z "$client" ] && continue
+            PCT=$(awk -v h="$hours" -v l="$HOURS_LIMIT" 'BEGIN{printf "%d", h * 100 / l}')
+            # Budget is a work signal, not a server fault: never escalate past warn.
+            if [ "$PCT" -ge 90 ]; then st=warn; else st=ok; fi
+            [ "$client" = "без клієнта" ] && st=info
+            label=$client
+            [ ${#label} -gt 15 ] && label="${label:0:14}…"
+            row "$st" "$label" "$(bar "$PCT")  ${B}${hours}${N}${DIM} год, лишилось $(awk -v h="$hours" -v l="$HOURS_LIMIT" 'BEGIN{r=l-h; printf "%.1f", (r<0?0:r)}')${N}"
+        done <<< "$HOURS"
+        hr
+    fi
+fi
+
+STATS=$(docker stats --no-stream --format '{{.MemUsage}}' \
+        solidtime solidtime-scheduler solidtime-queue "$DB_CONTAINER" solidtime-gotenberg 2>/dev/null \
+        | awk '{v=$1; u=v; gsub(/[0-9.]/,"",u); gsub(/[^0-9.]/,"",v);
+                if (u=="GiB") v*=1024; else if (u=="KiB") v/=1024; s+=v}
+               END{if (NR) printf "%d", s}')
+[ -n "$STATS" ] && row info "Ресурси" "${DIM}усі контейнери разом: ${STATS} МБ${N}"
+
+LAST=$(ls -1t /srv/backup/solidtime/*.tar.gz 2>/dev/null | head -1)
+if [ -n "$LAST" ]; then
+    AGE=$(( ( $(date +%s) - $(stat -c %Y "$LAST") ) / 86400 ))
+    DESC="$(date -r "$LAST" '+%F %H:%M'), $(du -h "$LAST" | cut -f1)"
+    if [ "$AGE" -le 2 ]; then row ok "Бекап" "$DESC"; else row warn "Бекап" "$DESC — $AGE дн. тому"; fi
+else
+    row warn "Бекап" "не налаштований — docs/timetracking.md, розділ «Бекапи»"
+fi
+
+verdict "Все працює" "Є проблеми — дивись рядки з ✖"

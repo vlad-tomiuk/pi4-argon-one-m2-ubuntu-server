@@ -14,7 +14,7 @@ LIB=/usr/local/lib/pi-server
 install -d "$LIB"
 install -m 644 "$REPO/bin/lib/ui.sh" "$LIB/ui.sh"
 
-for cmd in server-status server-update disk-status password-status bookmarks-status argon-fan argon-check argon-fan-test; do
+for cmd in server-status server-update disk-status password-status bookmarks-status timetracker-status argon-fan argon-check argon-fan-test; do
     [ -f "$REPO/bin/$cmd" ] || continue
     install -m 755 "$REPO/bin/$cmd" "/usr/local/bin/$cmd"
     echo "  /usr/local/bin/$cmd"

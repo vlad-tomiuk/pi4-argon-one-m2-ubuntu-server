@@ -1,0 +1,115 @@
+# solidtime: один образ у трьох ролях (веб, планувальник, черга) + PostgreSQL + Gotenberg для PDF.
+# Спільні налаштування винесені в якорі, щоб не повторювати їх тричі.
+
+x-env: &env
+  APP_NAME: solidtime
+  VITE_APP_NAME: solidtime
+  APP_ENV: production
+  APP_DEBUG: "false"
+  # HTTPS завершує Tailscale, до контейнера приходить звичайний HTTP
+  APP_FORCE_HTTPS: "true"
+  TRUSTED_PROXIES: "0.0.0.0/0,2000:0:0:0:0:0:0:0/3"
+  # Реєстрації немає зовсім: акаунт створюється командою, див. docs/timetracking.md
+  APP_ENABLE_REGISTRATION: "off"
+  # Логи йдуть у docker logs, а там уже є ротація (daemon.json)
+  LOG_CHANNEL: stderr
+  LOG_LEVEL: warning
+  DB_CONNECTION: pgsql
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  # База лише у внутрішній docker-мережі, SSL між контейнерами не потрібен
+  DB_SSLMODE: disable
+  DB_DATABASE: solidtime
+  DB_USERNAME: solidtime
+  # SMTP немає: листи (скидання пароля, запрошення) лише пишуться в лог
+  MAIL_MAILER: log
+  MAIL_FROM_ADDRESS: no-reply@localhost
+  MAIL_FROM_NAME: solidtime
+  QUEUE_CONNECTION: database
+  FILESYSTEM_DISK: local
+  PUBLIC_FILESYSTEM_DISK: public
+  GOTENBERG_URL: http://gotenberg:3000
+
+x-solidtime: &solidtime
+  image: solidtime/solidtime:latest
+  restart: unless-stopped
+  user: "1000:1000"
+  # APP_URL, APP_KEY, PASSPORT_*, DB_PASSWORD
+  env_file: .env
+  volumes:
+    # Службові файли Laravel (кеш, сесії) — у томі docker
+    - storage:/var/www/html/storage
+    # Завантаження й експорти — у папці поруч, її бекапить backup.sh
+    - ./data:/var/www/html/storage/app
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: solidtime-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: solidtime
+      POSTGRES_USER: solidtime
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U solidtime -d solidtime"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Без ports: база доступна лише застосунку всередині docker-мережі
+
+  solidtime:
+    <<: *solidtime
+    container_name: solidtime
+    environment:
+      <<: *env
+      CONTAINER_MODE: http
+      # Міграції бази при кожному старті: server-update оновлює образ без ручних кроків
+      AUTO_DB_MIGRATE: "true"
+    ports:
+      # Тільки локально: назовні віддає Tailscale
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8000/health-check/up"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  scheduler:
+    <<: *solidtime
+    container_name: solidtime-scheduler
+    environment:
+      <<: *env
+      CONTAINER_MODE: scheduler
+    healthcheck:
+      test: ["CMD", "healthcheck"]
+      interval: 60s
+
+  queue:
+    <<: *solidtime
+    container_name: solidtime-queue
+    environment:
+      <<: *env
+      CONTAINER_MODE: worker
+      WORKER_COMMAND: "php /var/www/html/artisan queue:work"
+    healthcheck:
+      test: ["CMD", "healthcheck"]
+      interval: 60s
+
+  gotenberg:
+    # Рендерить PDF-звіти (Chromium усередині). Без нього працює все, крім експорту в PDF
+    image: gotenberg/gotenberg:8
+    container_name: solidtime-gotenberg
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--silent", "--fail", "http://localhost:3000/health"]
+      interval: 60s
+
+volumes:
+  storage:

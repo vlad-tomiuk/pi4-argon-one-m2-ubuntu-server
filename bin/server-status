@@ -232,6 +232,7 @@ if [ "$QUIET" = 0 ]; then
     section "Корисні команди"
     sub "disk-status                мережевий диск"
     sub "password-status            менеджер паролів"
+    sub "timetracker-status         трекер часу і години за місяць"
     sub "server-update              оновити систему"
     sub "htop                       процеси наживо"
     sub "docker stats               навантаження контейнерів"

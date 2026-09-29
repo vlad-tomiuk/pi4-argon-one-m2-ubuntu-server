@@ -28,6 +28,7 @@ Cloudflare Tunnel, приватні сервіси — через Tailscale.
                      │   • портфоліо             • менеджер паролів │
                      │   • інші проєкти          • мережевий диск   │
                      │                           • закладки         │
+                     │                           • трекер часу      │
                      └──────────▲────────────────────────▲──────────┘
                                 │                        │
                        вхідний HTTPS              зашифроване P2P
@@ -50,8 +51,9 @@ Cloudflare Tunnel, приватні сервіси — через Tailscale.
 | **Мережевий диск** | SMB-диск фіксованого розміру, підключається у Windows як буква |
 | **Менеджер паролів** | Vaultwarden за Tailscale, з бекапами на окрему microSD |
 | **Закладки** | Linkwarden: колекції, теги, архівування сторінок, за Tailscale |
+| **Трекер часу** | solidtime: клієнти, проєкти, задачі, таймер на ПК, звіти, за Tailscale |
 | **Вентилятор Argon** | офіційний драйвер + власний запасний, якщо офіційний не працює |
-| **Команди** | `server-status`, `disk-status`, `password-status`, `bookmarks-status`, `server-update` |
+| **Команди** | `server-status`, `disk-status`, `password-status`, `bookmarks-status`, `timetracker-status`, `server-update` |
 | **Утиліти** | `htop`, `mc`, `tree`, `sqlite3` — ставляться одразу |
 
 ## Команди сервера
@@ -87,6 +89,7 @@ Cloudflare Tunnel, приватні сервіси — через Tailscale.
 | [storage.md](docs/storage.md) | мережевий диск і автопідключення у Windows |
 | [passwords.md](docs/passwords.md) | Vaultwarden за Tailscale |
 | [bookmarks.md](docs/bookmarks.md) | Linkwarden: закладки з архівуванням сторінок |
+| [timetracking.md](docs/timetracking.md) | solidtime: трекер часу з задачами і програмою для ПК |
 | [backups.md](docs/backups.md) | бекапи на microSD, відновлення, перевірка |
 | [security.md](docs/security.md) | що саме захищено і як зробити аудит |
 | [troubleshooting.md](docs/troubleshooting.md) | що робити, коли щось не працює |
@@ -106,6 +109,7 @@ systemd/                юніти (запасний драйвер вентил
 apps/                   сервіси, кожен окремим docker-compose проєктом
   vaultwarden/          менеджер паролів
   linkwarden/           закладки
+  solidtime/            трекер часу
 windows/                скрипти для клієнтського ПК
 docs/                   документація
 ```
